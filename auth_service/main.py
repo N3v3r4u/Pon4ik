@@ -29,7 +29,7 @@ def register_in_consul():
         "Address": socket.gethostbyname(socket.gethostname()),
         "Port": SERVICE_PORT,
         "Check": {
-            "HTTP": f"http://{socket.gethostbyname(socket.gethostname())}:{SERVICE_PORT}/",
+            "HTTP": f"http://{socket.gethostbyname(socket.gethostname())}:{SERVICE_PORT}/health",
             "Interval": "10s",
             "Timeout": "3s",
         },
@@ -80,7 +80,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # --- Схема извлечения токена из заголовка ---
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
-app = FastAPI(title="Auth Service")
+app = FastAPI(title="Auth Service", lifespan=lifespan)
 
 
 class UserRegister(BaseModel): # /register
