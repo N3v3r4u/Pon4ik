@@ -1,177 +1,189 @@
 import os
-import asyncio
 import socket
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import date
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from contextlib import asynccontextmanager
-
 import requests
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 
+INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "catalog-unknown")
 CONSUL_HOST = os.environ.get("CONSUL_HOST", "consul")
 CONSUL_PORT = os.environ.get("CONSUL_PORT", "8500")
 SERVICE_PORT = int(os.environ.get("PORT", "8000"))
 
-def register_in_consul(): #регистрация
-    service_id = f"{INSTANCE_NAME}-{socket.gethostname()}"
+#Модели
 
+class ProductCreate(BaseModel):
+    name: str = Field(min_length=3, max_length=100)
+    price: float = Field(gt=0)
+    description: Optional[str] = None
+
+
+class ProductUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=3, max_length=100)
+    price: Optional[float] = Field(default=None, gt=0)
+    description: Optional[str] = None
+
+
+class Product(BaseModel):
+    id: str
+    name: str
+    price: float
+    description: Optional[str] = None
+
+
+class PaginatedProducts(BaseModel):
+    instance_id: str
+    page: int
+    page_size: int
+    total: int
+    total_pages: int
+    items: list[Product]
+
+products_db: dict[str, dict] = {}
+
+#Сид
+
+SEED_PRODUCTS = {
+    "prod-1": {"id": "prod-1", "name": "Микрофон", "price": 15000.0, "description": "Для стримов"},
+    "prod-2": {"id": "prod-2", "name": "Кольцевая лампа", "price": 3000.0, "description": "Освещение"},
+    "prod-3": {"id": "prod-3", "name": "Звуковая карта", "price": 8000.0, "description": "Для записи"},
+}
+
+
+def _seed_products():
+    for pid, product in SEED_PRODUCTS.items():
+        if pid not in products_db:
+            products_db[pid] = product.copy()
+
+#Работа с Consul
+
+def register_in_consul():
+    service_id = f"{INSTANCE_NAME}-{socket.gethostname()}"
+    ip = socket.gethostbyname(socket.gethostname())
     payload = {
         "Name": "catalog",
         "ID": service_id,
-        "Address": socket.gethostbyname(socket.gethostname()),
+        "Address": ip,
         "Port": SERVICE_PORT,
         "Check": {
-            "HTTP": f"http://{socket.gethostbyname(socket.gethostname())}:{SERVICE_PORT}/",
+            "HTTP": f"http://{ip}:{SERVICE_PORT}/health",
             "Interval": "10s",
             "Timeout": "3s",
         },
     }
-
     url = f"http://{CONSUL_HOST}:{CONSUL_PORT}/v1/agent/service/register"
-
     for attempt in range(10):
         try:
-            response = requests.put(url, json=payload, timeout=3)
-            if response.status_code == 200:
+            r = requests.put(url, json=payload, timeout=3)
+            if r.status_code == 200:
                 print(f"[consul] Registered {service_id} as 'catalog'")
                 return
-            print(f"[consul] Attempt {attempt + 1}: HTTP {response.status_code}")
         except requests.RequestException as e:
             print(f"[consul] Attempt {attempt + 1}: {e}")
         asyncio.sleep(2)
 
-    print("[consul] Failed to register after 10 attempts — continuing without Consul")
 
-def deregister_from_consul(): #дерегистрация
+def deregister_from_consul():
     service_id = f"{INSTANCE_NAME}-{socket.gethostname()}"
     url = f"http://{CONSUL_HOST}:{CONSUL_PORT}/v1/agent/service/deregister/{service_id}"
     try:
-        response = requests.put(url, timeout=3)
-        if response.status_code == 200:
-            print(f"[consul] Deregistered {service_id}")
+        requests.put(url, timeout=3)
+        print(f"[consul] Deregistered {service_id}")
     except requests.RequestException as e:
         print(f"[consul] Deregistration failed: {e}")
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # === STARTUP ===
+    _seed_products()
     register_in_consul()
     yield
-    # === SHUTDOWN ===
     deregister_from_consul()
 
 
+app = FastAPI(
+    title="Catalog Service",
+    description="Каталог товаров (целей сбора)",
+    version="1.0.0",
+    docs_url="/api/catalog/docs",
+    openapi_url="/api/catalog/openapi.json",
+    lifespan=lifespan,
+)
+
+#Эндпоинты
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "instance_id": INSTANCE_NAME}
 
 
-app = FastAPI(title="Catalog Service — Goals", lifespan=lifespan)
-
-INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "catalog-unknown")
-
-class GoalCreate(BaseModel):
-    title: str = Field(min_length=3, max_length=100)
-    description: Optional[str] = None
-    target_amount: float = Field(gt=0, description="Сумма цели, больше 0")
-    deadline: Optional[date] = None
-
-
-class GoalUpdate(BaseModel):
-    title: Optional[str] = Field(default=None, min_length=3, max_length=100)
-    description: Optional[str] = None
-    target_amount: Optional[float] = Field(default=None, gt=0)
-    deadline: Optional[date] = None
-    status: Optional[str] = None
-
-
-class Goal(BaseModel):
-    id: str
-    author_id: str
-    title: str
-    description: Optional[str] = None
-    target_amount: float
-    collected_amount: float
-    deadline: Optional[date] = None
-    status: str
-    created_at: date
-
-# In-memory хранилище: goal_id -> словарь с данными цели
-goals_db: dict[str, dict] = {}
-
-VALID_STATUSES = {"active", "completed", "closed"}
-
-
-def _now() -> date: # вынесено в функцию для удобства тестирования
-    return date.today()
-
-
-def _new_goal_dict(goal: "GoalCreate", author_id: str) -> dict:
-    return {
-        "id": str(uuid4()),
-        "author_id": author_id,
-        "title": goal.title,
-        "description": goal.description,
-        "target_amount": goal.target_amount,
-        "collected_amount": 0.0,
-        "deadline": goal.deadline,
-        "status": "active",
-        "created_at": _now(),
-    }
-
-@app.get("/")
-def root():
-    return {
-        "service": "catalog",
-        "instance_id": INSTANCE_NAME,
-        "status": "ok",
-    }
-
-@app.get("/goals")
-def list_goals():
+@app.get("/api/catalog/products", response_model=PaginatedProducts)
+def list_products(
+    page: int = Query(1, ge=1, description="Номер страницы"),
+    page_size: int = Query(10, ge=1, le=100, description="Размер страницы"),
+):
+    all_products = list(products_db.values())
+    total = len(all_products)
+    total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+    start = (page - 1) * page_size
+    end = start + page_size
     return {
         "instance_id": INSTANCE_NAME,
-        "count": len(goals_db),
-        "goals": list(goals_db.values()),
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+        "items": all_products[start:end],
     }
 
-@app.post("/goals", response_model=Goal, status_code=201)
-def create_goal(goal: GoalCreate, author_id: str):
-    new_goal = _new_goal_dict(goal, author_id)
-    goals_db[new_goal["id"]] = new_goal
-    return new_goal
+@app.get("/api/catalog/products/batch", response_model=list[Product])
+def get_products_batch(ids: str = Query(..., description="Comma-separated product IDs")):
+    id_list = [pid.strip() for pid in ids.split(",") if pid.strip()]
+    return [products_db[pid] for pid in id_list if pid in products_db]
 
-@app.put("/goals/{goal_id}", response_model=Goal)
-def update_goal(goal_id: str, updates: GoalUpdate):
-    if goal_id not in goals_db:
-        raise HTTPException(status_code=404, detail="Goal not found")
+@app.get("/api/catalog/products/{product_id}", response_model=Product)
+def get_product(product_id: str):
+    if product_id not in products_db:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return products_db[product_id]
 
-    if updates.status is not None and updates.status not in VALID_STATUSES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid status. Allowed: {sorted(VALID_STATUSES)}",
-        )
 
-    goal = goals_db[goal_id]
+@app.post("/api/catalog/products", response_model=Product, status_code=201)
+def create_product(product: ProductCreate):
+    new_id = str(uuid4())
+    new_product = {
+        "id": new_id,
+        "name": product.name,
+        "price": product.price,
+        "description": product.description,
+    }
+    products_db[new_id] = new_product
+    return new_product
 
-    if updates.title is not None:
-        goal["title"] = updates.title
+
+@app.put("/api/catalog/products/{product_id}", response_model=Product)
+def update_product(product_id: str, updates: ProductUpdate):
+    if product_id not in products_db:
+        raise HTTPException(status_code=404, detail="Product not found")
+    product = products_db[product_id]
+    if updates.name is not None:
+        product["name"] = updates.name
+    if updates.price is not None:
+        product["price"] = updates.price
     if updates.description is not None:
-        goal["description"] = updates.description
-    if updates.target_amount is not None:
-        goal["target_amount"] = updates.target_amount
-    if updates.deadline is not None:
-        goal["deadline"] = updates.deadline
-    if updates.status is not None:
-        goal["status"] = updates.status
+        product["description"] = updates.description
+    return product
 
-    return goal
 
-@app.delete("/goals/{goal_id}")
-def delete_goal(goal_id: str):
-    if goal_id not in goals_db:
-        raise HTTPException(status_code=404, detail="Goal not found")
-
-    del goals_db[goal_id]
-    return {"message": f"Goal {goal_id} deleted"}
+@app.delete("/api/catalog/products/{product_id}")
+def delete_product(product_id: str):
+    if product_id not in products_db:
+        raise HTTPException(status_code=404, detail="Product not found")
+    del products_db[product_id]
+    return {"message": f"Product {product_id} deleted"}
 

@@ -80,7 +80,12 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # --- Схема извлечения токена из заголовка ---
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
-app = FastAPI(title="Auth Service", lifespan=lifespan)
+app = FastAPI(
+    title="Auth Service",
+    docs_url="/api/auth/docs",
+    openapi_url="/api/auth/openapi.json",
+    lifespan=lifespan,
+)
 
 
 class UserRegister(BaseModel): # /register
@@ -126,7 +131,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
 
     return username
 
-@app.post("/register")
+@app.post("/api/auth/register")
 def register(user: UserRegister):
     if user.username in users_db:
         raise HTTPException(status_code=400, detail="Username already registered")
@@ -138,7 +143,7 @@ def register(user: UserRegister):
     return {"message": "User registered successfully"}
 
 
-@app.post("/login", response_model=Token)
+@app.post("/api/auth/login", response_model=Token)
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = users_db.get(form_data.username)
     if not user or not verify_password(form_data.password, user["hashed_password"]):
@@ -152,7 +157,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-@app.get("/me")
+@app.get("/api/auth/me")
 def read_me(current_user: str = Depends(get_current_user)):
     return {"username": current_user, "message": f"Hello, {current_user}!"}
 
